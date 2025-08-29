@@ -2,10 +2,11 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Tuple , List
+from typing import Tuple, List
 import numpy as np
-from uuid import uuid4
 import json
+from uuid import uuid4
+
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
@@ -13,8 +14,8 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import httpx
 from openai import AzureOpenAI, RateLimitError
+from bson import ObjectId
 
-# === Local Import for Product Code Filler ===
 # ========= Load ENV =========
 load_dotenv()
 
@@ -31,17 +32,18 @@ AZURE_EMBED_DEPLOYMENT = os.getenv("AZURE_EMBED_DEPLOYMENT")
 # ========= MongoDB Connection =========
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
-
-# NOTE: keep invoice_collection under ak_fnp_embeddings as you said earlier
-col_fnp = client["ak_fnp_embeds"]["fnp_embeddings"]  # embeddings collection
-
-db_invoice = client["ak_fnp_embeddings"]["invoice_collection"]
+col_fnp = client["ak_fnp_embeds"]["fnp_embeddings"]
+# invoice collection
+PROD_MONGO_URI = os.getenv("PROD_MONGO_URI")
+PRODclient = MongoClient(PROD_MONGO_URI)
+db_invoice = PRODclient["yc-dev"]["tb_file_details"]
 
 # ========= Jobs tracking =========
 jobs = {}
-invoice_number_var = None   # Global var to store invoice number
+invoice_number_var = None   # Global var to store invoice number (optional)
 
 MIN_SIMILARITY = 0.75
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -126,25 +128,7 @@ class AzureLLMAgent:
             print(f"❌ Embedding error: {e}")
             return []
 
-    # ---- Search (optional future use) ----
-    def search_similar(self, query_text: str, top_k: int = 3):
-        query_emb = self.embed_text(query_text)
-        if not query_emb:
-            return []
-        results = db_invoice.aggregate([
-            {
-                "$vectorSearch": {
-                    "queryVector": query_emb,
-                    "path": "embedding",
-                    "numCandidates": 100,
-                    "limit": top_k,
-                    "index": "vector_index"
-                }
-            }
-        ])
-        return list(results)
-
-    # ---- LLM completion ----
+    # ---- LLM completion (generic) ----
     def complete(self, prompt: str) -> str:
         try:
             resp = self.client.chat.completions.create(
@@ -154,7 +138,7 @@ class AzureLLMAgent:
                         "role": "system",
                         "content": (
                             "You are an expert floral invoice processing system that extracts structured "
-                            "invoice details (vendor, invoice number, date, items)."
+                            "invoice details (vendor, invoice number, date, items). "
                             "Always return valid JSON only."
                         ),
                     },
@@ -172,7 +156,6 @@ class AzureLLMAgent:
             print(f"❌ LLM Error: {e}")
             return "{}"
 
-    # ---- Prompt builder ----
     def build_prompt(self, extracted_text: str):
         schema = {
             "vendorName": "Vendor Name",
@@ -180,7 +163,7 @@ class AzureLLMAgent:
             "invoiceDate": "YYYY-MM-DD",
             "items": [
                 {
-                    "productCode": None,   # <-- force null
+                    "productCode": None,
                     "skuProductName": "product description from the invoice",
                     "quantity": 0,
                     "unitPrice": 0.0,
@@ -201,16 +184,15 @@ class AzureLLMAgent:
             f"- Follow this schema strictly:\n{json.dumps(schema, indent=2)}\n\n"
             f"Extract JSON from this invoice text:\n{extracted_text}"
         )
-    
-    # ---- Prompt builder (invoice no + items only) ----
+
     def extract_invoice_and_items(self, ocr_text: str) -> dict:
-        """Use LLM to extract invoice number and item descriptions"""
+        """Use LLM to extract invoice number and item descriptions. JSON-only."""
         prompt = f"""
 You are given raw OCR text extracted from an invoice.
 
 Task:
 1. Extract the Invoice Number (example: 71281).
-2. Extract all the product/item description names.
+2. Extract all the product/item description names (strings).
 
 Return strictly in JSON format:
 {{
@@ -238,9 +220,9 @@ OCR text:
             print(f"⚠️ LLM parsing error: {e}")
             data = {"invoiceNumber": None, "itemDescriptions": []}
         return data
-    
+
     def choose_best_code(self, sku_name: str, candidates: list) -> str:
-        """Ask LLM to pick the most relevant productCode"""
+        """Ask LLM to pick the most relevant productCode from vector candidates."""
         prompt = f"""
 You are a floral product matcher.
 Original itemDescription: "{sku_name}"
@@ -272,10 +254,14 @@ Return strictly in JSON:
             print(f"⚠️ LLM selection error: {e}")
             return None
 
-    
+
+# ========= Similarity & Retrieval =========
 def cosine_similarity(vec1, vec2) -> float:
     v1, v2 = np.array(vec1), np.array(vec2)
-    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / denom)
 
 
 def get_top_chunks(helper: AzureLLMAgent, search_text: str, top_k: int = 3) -> List[dict]:
@@ -293,8 +279,12 @@ def get_top_chunks(helper: AzureLLMAgent, search_text: str, top_k: int = 3) -> L
             score = cosine_similarity(query_embedding, emb)
             if score >= MIN_SIMILARITY:
                 code = rmdtc_code
-                if not code and "code:" in text:
-                    code = text.split("code:")[1].strip().split()[0]
+                if not code and "code:" in text.lower():
+                    try:
+                        after = text.lower().split("code:")[1].strip()
+                        code = after.split()[0]
+                    except Exception:
+                        pass
                 similarities.append({
                     "productCode": code,
                     "itemDescription": text,
@@ -305,14 +295,16 @@ def get_top_chunks(helper: AzureLLMAgent, search_text: str, top_k: int = 3) -> L
     return similarities[:top_k]
 
 
-
-
-def process_invoice(text):
+# ========= Phase 2: Product code enrichment =========
+def process_invoice(ocr_text: str, payload: dict):
+    """
+    Takes raw OCR text, extracts invoice number + item descriptions,
+    and updates MongoDB updatedExtractedValues with productCode.
+    """
     helper = AzureLLMAgent()
-    
-    parsed = helper.extract_invoice_and_items(text)
+    parsed = helper.extract_invoice_and_items(ocr_text)
     invoice_no = parsed.get("invoiceNumber")
-    item_descs = parsed.get("itemDescriptions", [])
+    item_descs = parsed.get("itemDescriptions", []) or []
 
     print(f"\n📄 Invoice No: {invoice_no}")
     final_mappings = []
@@ -330,16 +322,16 @@ def process_invoice(text):
             final_mappings.append({"itemDescription": item, "productCode": best_code})
             print(f"✅ {item} → {best_code}")
 
-            # ----- MongoDB update -----
+            # ----- MongoDB update in updatedExtractedValues -----
             result = db_invoice.update_one(
-                {"invoiceNo": invoice_no, "items.skuProductName": item},
-                {"$set": {"items.$.productCode": best_code}}
+                {"clusterId": payload["clusterId"], "userId": payload["userId"], "fileName": payload["fileName"]},
+                {"$set": {"updatedExtractedValues.items.$[elem].productCode": best_code}},
+                array_filters=[{"elem.skuProductName": item}]
             )
             if result.modified_count > 0:
                 print(f"📝 Updated MongoDB for {item} with productCode {best_code}")
             else:
-                print(f"⚠️ No MongoDB row updated for {item}")
-
+                print(f"⚠️ No MongoDB row updated for {item} (check exact string match)")
         else:
             print(f"⚠️ Could not assign productCode for {item}")
 
@@ -347,48 +339,153 @@ def process_invoice(text):
     for mapping in final_mappings:
         print(mapping)
 
-# ========= Structured Extraction =========
+
+# ========= Phase 1: Structured Extraction =========def itemdescription_function(extracted_text: str):
 def itemdescription_function(extracted_text: str):
+    """
+    Builds a structured invoice JSON using AzureLLMAgent.
+    Returns dict (not inserted).
+    """
     global invoice_number_var
     agent = AzureLLMAgent()
 
+    # ---- Call LLM with structured schema prompt ----
     prompt = agent.build_prompt(extracted_text)
-    structured_json = agent.complete(prompt)
+    structured_json_text = agent.complete(prompt)
+
+    # ---- Canonical fallback extraction ----
+    canon = agent.extract_invoice_and_items(extracted_text)
+    canon_invoice_no = canon.get("invoiceNumber")
+    canon_items = canon.get("itemDescriptions", []) or []
 
     try:
-        # cleanup markdown fences if LLM wraps output
-        structured_json = structured_json.strip()
-        if structured_json.startswith("```"):
-            structured_json = structured_json.strip("`")
-            if structured_json.lower().startswith("json"):
-                structured_json = structured_json[4:].strip()
+        s = structured_json_text.strip()
+        if s.startswith("```"):
+            s = s.strip("`")
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
 
-        parsed = json.loads(structured_json)
+        parsed = json.loads(s)
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed structure is not a JSON object.")
 
-        # normalize productCode → None
-        if "items" in parsed and isinstance(parsed["items"], list):
+        # Ensure invoice number is set
+        if canon_invoice_no and not parsed.get("invoiceNo"):
+            parsed["invoiceNo"] = canon_invoice_no
+
+        # If LLM returned no items, fall back to canon_items
+        if not parsed.get("items"):
+            rebuilt_items = []
+            for name in canon_items:
+                rebuilt_items.append({
+                    "productCode": None,
+                    "skuProductName": name,
+                    "quantity": None,       # leave None instead of 0
+                    "unitPrice": None,
+                    "totalAmount": None,
+                    "currency": "INR",
+                    "matchConfidence": 0.0,
+                })
+            parsed["items"] = rebuilt_items
+        else:
+            # Normalize currency to INR in all items
             for item in parsed["items"]:
-                if not item.get("productCode") or str(item["productCode"]).lower() in ["null", "n/a", ""]:
-                    item["productCode"] = None
+                if not item.get("currency"):
+                    item["currency"] = "INR"
+                elif item["currency"].upper() == "AED":
+                    item["currency"] = "INR"
+                else:
+                    item["currency"] = "INR"
 
-        # set invoice number variable
+        # Store invoice number globally
         invoice_number_var = parsed.get("invoiceNo")
 
-        # 👉 insert into MongoDB
-        result = db_invoice.insert_one(parsed)
-
-        # ✅ fill missing product codes (post-processing step)
-        
-
-        # return parsed + Mongo _id
-        parsed["_id"] = str(result.inserted_id)
         return parsed
 
     except Exception as e:
         print(f"⚠️ Could not parse invoice JSON: {e}")
-        return {"rawStructured": structured_json}
-    
+        return {
+            "rawStructured": structured_json_text,
+            "invoiceNo": canon_invoice_no,
+            "itemDescriptions": canon_items,
+        }
 
-# Example run
-if __name__ == "__main__":
-    process_invoice("uploads/Invoice.pdf")
+
+
+# ========= End-to-End Runner =========
+
+def run_pipeline(file_path: str, payload: dict):
+    """
+    Full pipeline:
+    1) OCR the file
+    2) Update existing MongoDB document with extractedValues & updatedExtractedValues
+    3) Enrich productCode for each item
+    """
+    job_id = str(uuid4())
+    update_job_status(job_id, "started", f"Processing file: {file_path}")
+
+    try:
+        # ---- OCR ----
+        text, pages = run_local_ocr(file_path)
+        if not text:
+            update_job_status(job_id, "failed", "OCR failed or empty text")
+            print("❌ OCR returned no text.")
+            return
+
+        # ---- Phase 1: Structured JSON ----
+        structured_response = itemdescription_function(text)
+
+        # ---- Build wrapper invoice doc ----
+        invoice_doc = {
+            "pagesCount": pages,
+            "processingStatus": "Completed",
+            "processingMessage": "Processing completed successfully",
+            "extractedText": text,
+            "extractedValues": structured_response,
+            "updatedExtractedValues": structured_response,
+            "updatedAt": datetime.now(timezone.utc),
+        }
+
+        # ---- Ensure clusterId & userId are ObjectId ----
+        try:
+            cluster_oid = ObjectId(payload["clusterId"])
+            user_oid = ObjectId(payload["userId"])
+        except Exception as e:
+            print(f"❌ Invalid ObjectId format in payload: {e}")
+            update_job_status(job_id, "failed", "Invalid ObjectId in payload")
+            return
+
+        # ---- Update existing Mongo row (no insert) ----
+        result = db_invoice.update_one(
+            {
+                "clusterId": cluster_oid,
+                "userId": user_oid,
+                "fileName": payload["fileName"]
+            },
+            {"$set": invoice_doc},
+            upsert=False  # ⚡ Do NOT insert if missing
+        )
+
+        if result.matched_count > 0:
+            print(f"📝 Updated existing MongoDB row for {payload['fileName']}")
+        else:
+            print(f"⚠️ No matching document found for {payload['fileName']} (nothing updated)")
+
+        # ---- Phase 2: Enrich product codes ----
+        process_invoice(text, {
+            "clusterId": str(cluster_oid),  # pass back as str for consistency
+            "userId": str(user_oid),
+            "fileName": payload["fileName"]
+        })
+
+        update_job_status(
+            job_id,
+            "completed",
+            "OCR + Structured update + Product code enrichment done",
+            {"pages": pages}
+        )
+        print(f"✅ Job {job_id} completed.")
+
+    except Exception as e:
+        traceback.print_exc()
+        update_job_status(job_id, "failed", f"Unhandled error: {e}")

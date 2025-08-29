@@ -1,12 +1,11 @@
-# main.py
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from uuid import uuid4
 
-# Import functions from extract.py
-from complete import run_local_ocr, update_job_status, fetch_job_status, itemdescription_function , process_invoice
+# Import unified pipeline from complete.py
+from prod_mongo import run_pipeline, fetch_job_status, update_job_status
 
 app = FastAPI(title="Invoice Processing API")
 
@@ -16,7 +15,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ======= Request Models =======
 class FileJsonPayload(BaseModel):
-    fileId: str
+    clusterId: str
+    userId: str
+    fileName: str
 
 
 # ======= Routes =======
@@ -39,7 +40,7 @@ def get_status(job_id: str):
 # Upload + Process OCR → LLM → Store in Mongo
 @app.post("/upload/")
 def upload_json(payload: FileJsonPayload):
-    filename = payload.fileId
+    filename = payload.fileName
 
     # Check local folder first, then uploads folder
     local_path = os.path.join(os.getcwd(), filename)
@@ -59,29 +60,24 @@ def upload_json(payload: FileJsonPayload):
     update_job_status(job_id, "processing", "OCR processing started")
 
     try:
-    # ---- OCR Extract ----
-        text, pages = run_local_ocr(file_path)
+        # Prepare payload for run_pipeline
+        pipeline_payload = {
+            "clusterId": payload.clusterId,
+            "userId": payload.userId,
+            "fileName": filename
+        }
 
-        # ---- Extract + Store Structured JSON in Mongo ----
-        structured_response = itemdescription_function(text)
+        # Run complete pipeline (OCR + extraction + insert + enrichment)
+        run_pipeline(file_path, pipeline_payload)
 
-        # ---- Process Invoice (e.g., store in Mongo, enrich fields) ----
-        sent = process_invoice(text)
-
-        # ---- Save job status ----
+        # Update job status as completed
         update_job_status(
             job_id,
             "completed",
-            "OCR + Item description completed (stored in MongoDB)",
-            {
-                "raw_text": text,
-                "pages": pages,
-                "structured": structured_response,
-                "invoice_status": sent,   # include invoice process result
-            }
+            "Invoice processing completed successfully",
+            {"fileName": filename, "clusterId": payload.clusterId, "userId": payload.userId}
         )
 
-        # ---- Return final job status ----
         return fetch_job_status(job_id)
 
     except Exception as e:
